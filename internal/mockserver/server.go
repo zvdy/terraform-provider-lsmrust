@@ -2,6 +2,7 @@ package mockserver
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"log"
@@ -74,6 +75,7 @@ func New(cfg Config) *Server {
 		databases: map[string]*Database{},
 		keys:      map[string]*AccessKey{},
 	}
+	s.mux.HandleFunc("GET /healthz", s.healthz)
 	s.mux.HandleFunc("POST /v1/databases", s.createDatabase)
 	s.mux.HandleFunc("GET /v1/databases", s.listDatabases)
 	s.mux.HandleFunc("GET /v1/databases/{id}", s.getDatabase)
@@ -90,11 +92,29 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.Logger != nil {
 		s.cfg.Logger.Printf("%s %s", r.Method, r.URL.Path)
 	}
-	if s.cfg.APIKey != "" && r.Header.Get("Authorization") != "Bearer "+s.cfg.APIKey {
+	// Liveness/readiness probes carry no credentials and expose no state.
+	if r.Method == http.MethodGet && r.URL.Path == "/healthz" {
+		s.mux.ServeHTTP(w, r)
+		return
+	}
+	if s.cfg.APIKey != "" && !s.authorized(r) {
+		w.Header().Set("WWW-Authenticate", "Bearer")
 		writeError(w, http.StatusUnauthorized, "missing or invalid API key")
 		return
 	}
 	s.mux.ServeHTTP(w, r)
+}
+
+// authorized compares the bearer token in constant time, so response timing
+// does not leak how much of a guessed key was correct.
+func (s *Server) authorized(r *http.Request) bool {
+	got := r.Header.Get("Authorization")
+	want := "Bearer " + s.cfg.APIKey
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
+func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 type createDatabaseRequest struct {
@@ -370,8 +390,11 @@ func validateScopes(scopes []string) string {
 	return ""
 }
 
+// maxBodyBytes bounds a request body; every legitimate payload is well under 1 KiB.
+const maxBodyBytes = 1 << 20
+
 func decode(w http.ResponseWriter, r *http.Request, v any) bool {
-	dec := json.NewDecoder(r.Body)
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
